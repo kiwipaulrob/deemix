@@ -21,6 +21,15 @@
 					localStorage.getItem("selectedTheme")
 				);
 			}
+			// Spotify OAuth callback handler
+			const p=new URLSearchParams(location.search);
+			if(p.has('spotify_connected')){
+				if(window.opener){window.opener.postMessage('spotifyOAuthSuccess','*');}
+				window.close();
+			}else if(p.has('spotify_error')){
+				if(window.opener){window.opener.postMessage('spotifyOAuthError','*');}
+				window.close();
+			}
 		</script>
 	</head>
 

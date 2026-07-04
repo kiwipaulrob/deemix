@@ -17,7 +17,7 @@ const handler: ApiHandler["handler"] = (req, res) => {
 	const redirectUri = `${protocol}://${host}/api/spotifyCallback`;
 
 	const authUrl = spotify.getAuthUrl(redirectUri);
-	res.redirect(authUrl);
+	res.send(`<html><body><script>window.location.href="${authUrl}";</script></body></html>`);
 };
 
 const apiHandler: ApiHandler = { path, handler };

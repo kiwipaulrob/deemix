@@ -25,10 +25,9 @@ const handler: ApiHandler["handler"] = async (req, res) => {
 
 	try {
 		await spotify.handleAuthCallback(code as string, redirectUri, state as string);
-		// Redirect back to the app settings page with success indicator
-		res.send(`<html><body><h2>Spotify Connected!</h2><p>You can close this window.</p><script>if(window.opener){window.opener.postMessage('spotifyOAuthSuccess','*');setTimeout(()=>window.close(),1500)}else{setTimeout(()=>{window.location.href='/'},1500)}</script></body></html>`);
+		res.send(`<!DOCTYPE html><html><head><meta http-equiv="refresh" content="0;url=/?spotify_connected=1"></head><body></body></html>`);
 	} catch (e) {
-		res.status(500).send(`<html><body><h2>Auth Failed</h2><p>${e.message}</p><script>setTimeout(()=>window.close(),5000)</script></body></html>`);
+		res.send(`<!DOCTYPE html><html><head><meta http-equiv="refresh" content="0;url=/?spotify_error=${encodeURIComponent(e.message)}"></head><body></body></html>`);
 	}
 };
 
