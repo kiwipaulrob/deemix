@@ -11,10 +11,8 @@ const handler: ApiHandler["handler"] = (req, res) => {
 		return;
 	}
 
-	// Build redirect URI from the current request origin
-	const protocol = req.headers["x-forwarded-proto"] || req.protocol || "http";
-	const host = req.headers["x-forwarded-host"] || req.headers.host;
-	const redirectUri = `${protocol}://${host}/api/spotifyCallback`;
+	// Hardcoded redirect URI — must match Spotify app dashboard exactly
+	const redirectUri = `https://deemix.robertsons.cloud/api/spotifyCallback`;
 
 	const authUrl = spotify.getAuthUrl(redirectUri);
 	res.send(`<html><body><script>window.location.href="${authUrl}";</script></body></html>`);
