@@ -180,6 +180,51 @@ export default class SpotifyPlugin extends BasePlugin {
 		}
 	}
 
+	// Spotify Feb 2026 migration (Development Mode apps, enforced 9 Mar 2026):
+	// GET /playlists/{id}/tracks was replaced by GET /playlists/{id}/items,
+	// and the shape changed from tracks.items[].track to items.items[].item.
+	// Extended Quota apps still serve the old shape, and the pinned
+	// @spotify/web-api-ts-sdk@1.2.0 still generates /tracks URLs, so every
+	// playlist page is normalized here into the legacy
+	// { items, next, total, href } form (each entry exposing .track).
+	private normalizeTracksPage(page: any): any {
+		if (!page || typeof page !== "object") return page;
+		const rawItems: any[] = Array.isArray((page as any)?.items?.items)
+			? (page as any).items.items
+			: Array.isArray((page as any)?.tracks?.items)
+				? (page as any).tracks.items
+				: Array.isArray((page as any)?.items)
+					? (page as any).items
+					: [];
+		const maybeItemsPage = (page as any)?.items;
+		const source =
+			maybeItemsPage && !Array.isArray(maybeItemsPage)
+				? maybeItemsPage
+				: ((page as any)?.tracks ?? page);
+		const normalizedItems = rawItems.map((entry: any) => {
+			if (!entry || typeof entry !== "object") return entry;
+			const track = entry.item ?? entry.track;
+			if (track && !entry.track) return { ...entry, track };
+			return entry;
+		});
+		return {
+			...source,
+			items: normalizedItems,
+			next: source?.next ?? (page as any)?.next ?? null,
+			total: source?.total ?? (page as any)?.total ?? normalizedItems.length,
+			href: source?.href ?? (page as any)?.href ?? "",
+		};
+	}
+
+	private normalizePlaylistTracksPage(playlist: any): void {
+		if (!playlist || typeof playlist !== "object") return;
+		if (!playlist.tracks && playlist.items) {
+			playlist.tracks = this.normalizeTracksPage(playlist.items);
+		} else if (playlist.tracks) {
+			playlist.tracks = this.normalizeTracksPage(playlist.tracks);
+		}
+	}
+
 	async generatePlaylistItem(dz: Deezer, link_id: string, bitrate: number) {
 		if (!this.enabled) throw new PluginNotEnabledError("Spotify");
 		await this.ensureValidToken();
@@ -209,9 +254,24 @@ export default class SpotifyPlugin extends BasePlugin {
 			}
 		}
 
-		// Handle null tracks (Spotify Dev Mode apps return null tracks for public playlists)
-		if (!spotifyPlaylist.tracks) {
-			spotifyPlaylist.tracks = await this.sp.playlists.getPlaylistItems(link_id);
+		// Normalize Feb 2026 (`items`) and legacy (`tracks`) playlist shapes
+		this.normalizePlaylistTracksPage(spotifyPlaylist);
+
+		// Handle null/missing track pages (Spotify Dev Mode apps return null
+		// tracks for some playlists): try the Feb 2026 `/items` endpoint
+		// first via direct HTTP, then fall back to the SDK (which still
+		// targets `/tracks` and only helps Extended Quota apps).
+		if (!spotifyPlaylist.tracks?.items) {
+			const itemsPage = (await this.spotifyApiGet(
+				`/playlists/${link_id}/items?offset=0&limit=50`
+			)) as any;
+			if (itemsPage) {
+				spotifyPlaylist.tracks = this.normalizeTracksPage(itemsPage);
+			} else {
+				spotifyPlaylist.tracks = this.normalizeTracksPage(
+					await this.sp.playlists.getPlaylistItems(link_id)
+				);
+			}
 		}
 
 		const playlistAPI: any = this._convertPlaylistStructure(spotifyPlaylist);
@@ -225,7 +285,9 @@ export default class SpotifyPlugin extends BasePlugin {
 			const offset = parseInt(regExec[1]);
 			const limit = parseInt(regExec[2]) as MaxInt<50>;
 
-			let playlistTracks = await this.spotifyApiGet(`/playlists/${link_id}/tracks?offset=${offset}&limit=${limit}`) as any;
+			let playlistTracks = (await this.spotifyApiGet(
+				`/playlists/${link_id}/items?offset=${offset}&limit=${limit}`
+			)) as any;
 			if (!playlistTracks) {
 				playlistTracks = await this.sp.playlists.getPlaylistItems(
 					link_id,
@@ -236,16 +298,17 @@ export default class SpotifyPlugin extends BasePlugin {
 				);
 			}
 
-			spotifyPlaylist.tracks = playlistTracks;
+			spotifyPlaylist.tracks = this.normalizeTracksPage(playlistTracks);
 			tracklistTemp = tracklistTemp.concat(spotifyPlaylist.tracks.items);
 		}
 
 		const tracklist: SpotifyTrack[] = [];
 		tracklistTemp.forEach((item) => {
-			if (!item.track) return; // Skip everything that isn't a track
-			if (item.track.explicit && !playlistAPI.explicit)
-				playlistAPI.explicit = true;
-			tracklist.push(item.track);
+			// Feb 2026 shape wraps each entry as `item`; legacy shape uses `track`
+			const track = item?.item ?? item?.track;
+			if (!track) return; // Skip everything that isn't a track
+			if (track.explicit && !playlistAPI.explicit) playlistAPI.explicit = true;
+			tracklist.push(track);
 		});
 		if (!playlistAPI.explicit) playlistAPI.explicit = false;
 
@@ -447,10 +510,11 @@ export default class SpotifyPlugin extends BasePlugin {
 				})
 				.json();
 
-			const trackItems: any[] = Array.isArray(playlist?.tracks?.items)
-				? [...playlist.tracks.items]
+			const trackPage: any = playlist?.items ?? playlist?.tracks;
+			const trackItems: any[] = Array.isArray(trackPage?.items)
+				? [...trackPage.items]
 				: [];
-			let nextUrl: string | null = playlist?.tracks?.next || null;
+			let nextUrl: string | null = trackPage?.next || null;
 
 			while (nextUrl) {
 				const page: any = await got
@@ -468,11 +532,17 @@ export default class SpotifyPlugin extends BasePlugin {
 
 			const tracklist: SpotifyTrack[] = [];
 			for (const item of trackItems) {
-				if (!item?.track || typeof item.track.id !== "string") continue;
-				tracklist.push(item.track);
+				const track = item?.item ?? item?.track;
+				if (!track || typeof track.id !== "string") continue;
+				tracklist.push(track);
 			}
 
 			if (!tracklist.length) return null;
+			const normalized = this.normalizeTracksPage(
+				playlist.tracks ?? playlist.items
+			);
+			playlist.tracks =
+				normalized && typeof normalized === "object" ? normalized : {};
 			playlist.tracks.items = trackItems;
 			playlist.tracks.total = tracklist.length;
 
@@ -733,6 +803,9 @@ export default class SpotifyPlugin extends BasePlugin {
 	}
 
 	_convertPlaylistStructure(spotifyPlaylist) {
+		// Normalize Feb 2026 (`items`) and legacy (`tracks`) shapes so both
+		// Development Mode and Extended Quota responses report correct counts.
+		this.normalizePlaylistTracksPage(spotifyPlaylist);
 		let cover = null;
 		// Mickey: some playlists can be faulty, for example https://open.spotify.com/playlist/7vyEjAGrXOIjqlC8pZRupW
 		if (spotifyPlaylist?.images?.length) cover = spotifyPlaylist.images[0].url;
