@@ -5,7 +5,10 @@ import {
 	AlbumNotOnDeezer,
 	InvalidID,
 	PluginNotEnabledError,
+	SpotifyAuthFailed,
+	SpotifyPlaylistAccessForbidden,
 	SpotifyPlaylistNotAccessible,
+	SpotifyRateLimited,
 	TrackNotOnDeezer,
 } from "@/errors.js";
 import { type Settings } from "@/types/Settings.js";
@@ -13,7 +16,6 @@ import { getConfigFolder } from "@/utils/localpaths.js";
 import {
 	type Market,
 	SpotifyApi,
-	type MaxInt,
 	type Track as SpotifyTrack,
 	type AccessToken,
 } from "@spotify/web-api-ts-sdk";
@@ -49,6 +51,10 @@ export default class SpotifyPlugin extends BasePlugin {
 		expiresAt: number; // Unix timestamp in ms
 	} | null;
 	oauthState: string | null; // CSRF protection
+	private clientCredentialsToken: {
+		accessToken: string;
+		expiresAt: number;
+	} | null = null;
 
 	constructor(configFolder = undefined) {
 		super();
@@ -182,63 +188,15 @@ export default class SpotifyPlugin extends BasePlugin {
 
 	async generatePlaylistItem(dz: Deezer, link_id: string, bitrate: number) {
 		if (!this.enabled) throw new PluginNotEnabledError("Spotify");
-		await this.ensureValidToken();
-		let spotifyPlaylist = await this.spotifyApiGet(`/playlists/${link_id}`) as any;
-		let market: Market | undefined;
+		const spotifyPlaylist = await this.getPlaylistWithItems(link_id);
 		if (!spotifyPlaylist) {
-			// Fall back to SDK, with market retry for region-locked playlists
-			try {
-				spotifyPlaylist = await this.sp.playlists.getPlaylist(link_id);
-			} catch (e) {
-				if (this.getSpotifyErrorStatus(e) === 404) {
-					market = "US";
-					try {
-						spotifyPlaylist = await this.sp.playlists.getPlaylist(
-							link_id,
-							market
-						);
-					} catch (retryError) {
-						if (this.getSpotifyErrorStatus(retryError) === 404) {
-							return this.generatePlaylistItemFromPage(dz, link_id, bitrate);
-						}
-						throw retryError;
-					}
-				} else {
-					throw e;
-				}
-			}
-		}
-
-		// Handle null tracks (Spotify Dev Mode apps return null tracks for public playlists)
-		if (!spotifyPlaylist.tracks) {
-			spotifyPlaylist.tracks = await this.sp.playlists.getPlaylistItems(link_id);
+			return this.generatePlaylistItemFromPage(dz, link_id, bitrate);
 		}
 
 		const playlistAPI: any = this._convertPlaylistStructure(spotifyPlaylist);
 		playlistAPI.various_artist = await dz.api.get_artist(5080); // Useful for save as compilation
 
-		let tracklistTemp = spotifyPlaylist.tracks.items;
-		while (spotifyPlaylist.tracks.next) {
-			const regExec = /offset=(\d+)&limit=(\d+)/g.exec(
-				spotifyPlaylist.tracks.next
-			);
-			const offset = parseInt(regExec[1]);
-			const limit = parseInt(regExec[2]) as MaxInt<50>;
-
-			let playlistTracks = await this.spotifyApiGet(`/playlists/${link_id}/tracks?offset=${offset}&limit=${limit}`) as any;
-			if (!playlistTracks) {
-				playlistTracks = await this.sp.playlists.getPlaylistItems(
-					link_id,
-					market,
-					undefined,
-					limit,
-					offset
-				);
-			}
-
-			spotifyPlaylist.tracks = playlistTracks;
-			tracklistTemp = tracklistTemp.concat(spotifyPlaylist.tracks.items);
-		}
+		const tracklistTemp = spotifyPlaylist.tracks.items;
 
 		const tracklist: SpotifyTrack[] = [];
 		tracklistTemp.forEach((item) => {
@@ -265,6 +223,129 @@ export default class SpotifyPlugin extends BasePlugin {
 			plugin: "spotify",
 			conversion_data: tracklist,
 		});
+	}
+
+	/**
+	 * Fetches a playlist using Spotify's February 2026 response shape and
+	 * normalizes it to the legacy shape used internally by deemix.
+	 */
+	async getPlaylistWithItems(
+		linkId: string,
+		market?: Market
+	): Promise<any | null> {
+		await this.ensureValidToken();
+
+		const marketQuery = market ? `?market=${encodeURIComponent(market)}` : "";
+		let playlist: any;
+		try {
+			playlist = await this.spotifyApiGet(`/playlists/${linkId}${marketQuery}`);
+		} catch (error: any) {
+			const status =
+				this.getSpotifyApiErrorStatus(error) ??
+				this.getSpotifyErrorStatus(error);
+			if (
+				error instanceof SpotifyPlaylistAccessForbidden ||
+				error instanceof SpotifyAuthFailed ||
+				error instanceof SpotifyRateLimited
+			) {
+				throw error;
+			}
+			if (status === 403) {
+				throw new SpotifyPlaylistAccessForbidden(
+					`https://open.spotify.com/playlist/${linkId}`
+				);
+			}
+			if (status === 401) {
+				throw new SpotifyAuthFailed(
+					`Spotify authentication failed (401) for /playlists/${linkId}. Please re-authenticate.`
+				);
+			}
+			if (status === 429) {
+				throw new SpotifyRateLimited();
+			}
+			if (!market && status === 404) {
+				return this.getPlaylistWithItems(linkId, "US");
+			}
+			if (status === 404) return null;
+			throw error;
+		}
+
+		if (!playlist) return null;
+
+		// Development Mode returns `items`; Extended Mode can still return
+		// the legacy `tracks` field. Contents are absent for playlists the
+		// current user neither owns nor collaborates on.
+		const firstPage = playlist.items ?? playlist.tracks;
+		if (!firstPage) return null;
+
+		const normalizedFirstPage = this.normalizePlaylistItemsPage(firstPage);
+		const allItems = [...normalizedFirstPage.items];
+		let nextUrl = normalizedFirstPage.next as string | null;
+
+		while (nextUrl) {
+			const next = new URL(nextUrl);
+			const params = new URLSearchParams();
+			for (const key of [
+				"market",
+				"fields",
+				"limit",
+				"offset",
+				"additional_types",
+			]) {
+				const value = next.searchParams.get(key);
+				if (value !== null) params.set(key, value);
+			}
+			const query = params.size ? `?${params.toString()}` : "";
+			let page: any;
+			try {
+				page = await this.spotifyApiGet(`/playlists/${linkId}/items${query}`);
+			} catch (error: any) {
+				if (
+					error instanceof SpotifyPlaylistAccessForbidden ||
+					error instanceof SpotifyAuthFailed ||
+					error instanceof SpotifyRateLimited
+				) {
+					throw error;
+				}
+				const status =
+					this.getSpotifyApiErrorStatus(error) ??
+					this.getSpotifyErrorStatus(error);
+				if (status === 403) {
+					throw new SpotifyPlaylistAccessForbidden(
+						`https://open.spotify.com/playlist/${linkId}`
+					);
+				}
+				if (status === 401) throw new SpotifyAuthFailed();
+				if (status === 429) throw new SpotifyRateLimited();
+				throw error;
+			}
+			if (!page) return null;
+
+			const normalizedPage = this.normalizePlaylistItemsPage(page);
+			allItems.push(...normalizedPage.items);
+			nextUrl = normalizedPage.next;
+		}
+
+		playlist.tracks = {
+			...normalizedFirstPage,
+			items: allItems,
+			next: null,
+			total: normalizedFirstPage.total ?? allItems.length,
+		};
+		return playlist;
+	}
+
+	private normalizePlaylistItemsPage(page: any) {
+		return {
+			...page,
+			items: Array.isArray(page?.items)
+				? page.items.map((entry: any) =>
+						entry?.track || !("item" in (entry ?? {}))
+							? entry
+							: { ...entry, track: entry.item }
+					)
+				: [],
+		};
 	}
 
 	async generatePlaylistItemFromPage(
@@ -447,10 +528,11 @@ export default class SpotifyPlugin extends BasePlugin {
 				})
 				.json();
 
-			const trackItems: any[] = Array.isArray(playlist?.tracks?.items)
-				? [...playlist.tracks.items]
+			const playlistItems = playlist?.items ?? playlist?.tracks;
+			const trackItems: any[] = Array.isArray(playlistItems?.items)
+				? [...playlistItems.items]
 				: [];
-			let nextUrl: string | null = playlist?.tracks?.next || null;
+			let nextUrl: string | null = playlistItems?.next || null;
 
 			while (nextUrl) {
 				const page: any = await got
@@ -468,13 +550,19 @@ export default class SpotifyPlugin extends BasePlugin {
 
 			const tracklist: SpotifyTrack[] = [];
 			for (const item of trackItems) {
-				if (!item?.track || typeof item.track.id !== "string") continue;
-				tracklist.push(item.track);
+				const track = item?.track ?? item?.item;
+				if (!track || typeof track.id !== "string") continue;
+				tracklist.push(track);
 			}
 
 			if (!tracklist.length) return null;
-			playlist.tracks.items = trackItems;
-			playlist.tracks.total = tracklist.length;
+			playlist.tracks = {
+				...playlistItems,
+				items: trackItems.map((item) =>
+					item?.track ? item : { ...item, track: item?.item }
+				),
+				total: tracklist.length,
+			};
 
 			return {
 				playlist,
@@ -773,7 +861,7 @@ export default class SpotifyPlugin extends BasePlugin {
 			public: spotifyPlaylist.public,
 			share: spotifyPlaylist.external_urls.spotify,
 			title: spotifyPlaylist.name,
-			tracklist: spotifyPlaylist.tracks?.href ?? '',
+			tracklist: spotifyPlaylist.tracks?.href ?? "",
 			type: "playlist",
 		};
 
@@ -921,34 +1009,131 @@ export default class SpotifyPlugin extends BasePlugin {
 		const token: AccessToken = {
 			access_token: this.oauthTokens.accessToken,
 			token_type: "Bearer",
-			expires_in: Math.max(0, Math.floor((this.oauthTokens.expiresAt - Date.now()) / 1000)),
+			expires_in: Math.max(
+				0,
+				Math.floor((this.oauthTokens.expiresAt - Date.now()) / 1000)
+			),
 			refresh_token: this.oauthTokens.refreshToken,
 		};
-		this.sp = SpotifyApi.withAccessToken(
-			this.credentials.clientId,
-			token
-		);
+		this.sp = SpotifyApi.withAccessToken(this.credentials.clientId, token);
+	}
+
+	private async getClientCredentialsAccessToken(): Promise<string | null> {
+		if (!this.credentials.clientId || !this.credentials.clientSecret)
+			return null;
+		if (
+			this.clientCredentialsToken &&
+			Date.now() < this.clientCredentialsToken.expiresAt - 60000
+		) {
+			return this.clientCredentialsToken.accessToken;
+		}
+		const basicAuth = Buffer.from(
+			`${this.credentials.clientId}:${this.credentials.clientSecret}`
+		).toString("base64");
+		try {
+			const response: any = await got
+				.post("https://accounts.spotify.com/api/token", {
+					headers: {
+						Authorization: `Basic ${basicAuth}`,
+						"Content-Type": "application/x-www-form-urlencoded",
+					},
+					form: {
+						grant_type: "client_credentials",
+					},
+				})
+				.json();
+			if (!response.access_token) return null;
+			this.clientCredentialsToken = {
+				accessToken: response.access_token,
+				expiresAt: Date.now() + response.expires_in * 1000,
+			};
+			return response.access_token;
+		} catch {
+			return null;
+		}
+	}
+
+	private getSpotifyApiErrorStatus(error: any): number | undefined {
+		const status =
+			error?.response?.statusCode ??
+			error?.statusCode ??
+			error?.status ??
+			this.getSpotifyErrorStatus(error);
+		if (typeof status === "number") return status;
+		return undefined;
+	}
+
+	private createSpotifyApiError(
+		status: number | undefined,
+		endpoint: string
+	): Error | null {
+		const linkIdMatch = /\/playlists\/([^/?]+)/.exec(endpoint);
+		const linkId = linkIdMatch?.[1];
+		const link = linkId
+			? `https://open.spotify.com/playlist/${linkId}`
+			: endpoint;
+
+		if (status === 401) {
+			return new SpotifyAuthFailed(
+				`Spotify authentication failed (401) for ${endpoint}. Please re-authenticate.`
+			);
+		}
+		if (status === 403) {
+			if (endpoint.includes("/playlists/")) {
+				return new SpotifyPlaylistAccessForbidden(link);
+			}
+			return null;
+		}
+		if (status === 429) {
+			return new SpotifyRateLimited(
+				`Spotify rate limit exceeded (429) for ${endpoint}. Please try again later.`
+			);
+		}
+		return null;
 	}
 
 	/**
 	 * Direct Spotify API call using got + Bearer token.
 	 * Bypasses the @spotify/web-api-ts-sdk which has issues with withAccessToken.
-	 * Falls back to null if no OAuth tokens, so callers use the SDK instead.
+	 * Supports both OAuth and Client Credentials flows.
+	 * Throws typed errors for 401/403/429 so callers can distinguish.
 	 */
 	private async spotifyApiGet(endpoint: string): Promise<any | null> {
-		if (!this.oauthTokens?.accessToken) return null;
-		await this.ensureValidToken();
+		let accessToken: string | null = null;
+		if (this.oauthTokens?.accessToken) {
+			await this.ensureValidToken();
+			accessToken = this.oauthTokens.accessToken;
+		} else {
+			accessToken = await this.getClientCredentialsAccessToken();
+			if (!accessToken) return null;
+		}
+
 		try {
-			const response = await got.get(`https://api.spotify.com/v1${endpoint}`, {
-				headers: {
-					'Authorization': `Bearer ${this.oauthTokens.accessToken}`,
-				},
-			}).json();
+			const response = await got
+				.get(`https://api.spotify.com/v1${endpoint}`, {
+					headers: {
+						Authorization: `Bearer ${accessToken}`,
+					},
+				})
+				.json();
 			return response;
-		} catch (e) {
-			// If OAuth request fails, return null to fall back to SDK
-			console.error('[spotify] Direct OAuth API call failed:', e.message);
-			return null;
+		} catch (e: any) {
+			const status = this.getSpotifyApiErrorStatus(e);
+			const typedError = this.createSpotifyApiError(status, endpoint);
+			if (typedError) {
+				throw typedError;
+			}
+			// Preserve original error for other statuses (404 etc.)
+			// For 404, callers handle as null; throw to let them decide
+			if (status === 404) {
+				// Log without sensitive data
+				console.error(`[spotify] API 404 for ${endpoint}: ${e.message}`);
+				throw e;
+			}
+			console.error(
+				`[spotify] Direct API call failed for ${endpoint}: ${e.message} status=${status}`
+			);
+			throw e;
 		}
 	}
 
@@ -967,7 +1152,11 @@ export default class SpotifyPlugin extends BasePlugin {
 		return `https://accounts.spotify.com/authorize?${params.toString()}`;
 	}
 
-	async handleAuthCallback(code: string, redirectUri: string, state: string): Promise<boolean> {
+	async handleAuthCallback(
+		code: string,
+		redirectUri: string,
+		state: string
+	): Promise<boolean> {
 		// Verify CSRF state
 		if (this.oauthState && state !== this.oauthState) {
 			throw new Error("OAuth state mismatch — possible CSRF attack");
@@ -979,26 +1168,30 @@ export default class SpotifyPlugin extends BasePlugin {
 			`${this.credentials.clientId}:${this.credentials.clientSecret}`
 		).toString("base64");
 
-		const response: any = await got.post("https://accounts.spotify.com/api/token", {
-			headers: {
-				"Authorization": `Basic ${basicAuth}`,
-				"Content-Type": "application/x-www-form-urlencoded",
-			},
-			form: {
-				grant_type: "authorization_code",
-				code,
-				redirect_uri: redirectUri,
-			},
-		}).json();
+		const response: any = await got
+			.post("https://accounts.spotify.com/api/token", {
+				headers: {
+					Authorization: `Basic ${basicAuth}`,
+					"Content-Type": "application/x-www-form-urlencoded",
+				},
+				form: {
+					grant_type: "authorization_code",
+					code,
+					redirect_uri: redirectUri,
+				},
+			})
+			.json();
 
 		if (!response.access_token) {
-			throw new Error(`Spotify token exchange failed: ${JSON.stringify(response)}`);
+			throw new Error(
+				`Spotify token exchange failed: ${JSON.stringify(response)}`
+			);
 		}
 
 		this.oauthTokens = {
 			accessToken: response.access_token,
 			refreshToken: response.refresh_token,
-			expiresAt: Date.now() + (response.expires_in * 1000),
+			expiresAt: Date.now() + response.expires_in * 1000,
 		};
 
 		this._initWithOAuthToken();
@@ -1015,21 +1208,23 @@ export default class SpotifyPlugin extends BasePlugin {
 		).toString("base64");
 
 		try {
-			const response: any = await got.post("https://accounts.spotify.com/api/token", {
-				headers: {
-					"Authorization": `Basic ${basicAuth}`,
-					"Content-Type": "application/x-www-form-urlencoded",
-				},
-				form: {
-					grant_type: "refresh_token",
-					refresh_token: this.oauthTokens.refreshToken,
-				},
-			}).json();
+			const response: any = await got
+				.post("https://accounts.spotify.com/api/token", {
+					headers: {
+						Authorization: `Basic ${basicAuth}`,
+						"Content-Type": "application/x-www-form-urlencoded",
+					},
+					form: {
+						grant_type: "refresh_token",
+						refresh_token: this.oauthTokens.refreshToken,
+					},
+				})
+				.json();
 
 			if (!response.access_token) return false;
 
 			this.oauthTokens.accessToken = response.access_token;
-			this.oauthTokens.expiresAt = Date.now() + (response.expires_in * 1000);
+			this.oauthTokens.expiresAt = Date.now() + response.expires_in * 1000;
 			// Spotify may issue a new refresh token
 			if (response.refresh_token) {
 				this.oauthTokens.refreshToken = response.refresh_token;
@@ -1052,7 +1247,7 @@ export default class SpotifyPlugin extends BasePlugin {
 	}
 
 	isOAuthAuthenticated(): boolean {
-		return !!(this.oauthTokens?.accessToken);
+		return !!this.oauthTokens?.accessToken;
 	}
 
 	logoutOAuth(): void {
