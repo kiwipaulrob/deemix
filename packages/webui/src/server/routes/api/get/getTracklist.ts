@@ -25,7 +25,8 @@ const handler: ApiHandler["handler"] = async (req, res) => {
 		}
 		case "spotifyplaylist":
 		case "spotify_playlist": {
-			if (!deemix.plugins.spotify.enabled) {
+			const spotify = deemix.plugins.spotify;
+			if (!spotify.enabled) {
 				res.send({
 					collaborative: false,
 					description: "",
@@ -45,30 +46,85 @@ const handler: ApiHandler["handler"] = async (req, res) => {
 				});
 				break;
 			}
-			const sp = deemix.plugins.spotify.sp;
-			const playlist = await sp.playlists.getPlaylist(list_id);
-			let tracklist = playlist.tracks.items;
-			while (playlist.tracks.next) {
-				const regExec = /offset=(\d+)&limit=(\d+)/g.exec(playlist.tracks.next);
-				const offset = regExec![1];
-				const limit = regExec![2];
-				const playlistTracks = await sp.playlists.getPlaylistItems(
-					list_id,
-					undefined,
-					undefined,
-					limit,
-					offset
-				);
+			try {
+				let playlist = await spotify.getPlaylistWithItems(list_id);
+				if (!playlist) {
+					const fallback = await spotify.generatePlaylistItemFromPage(
+						dz,
+						list_id,
+						0
+					);
+					playlist = {
+						collaborative: false,
+						description: fallback.collection.playlistAPI.description ?? "",
+						external_urls: {
+							spotify: `https://open.spotify.com/playlist/${list_id}`,
+						},
+						followers: {
+							total: fallback.collection.playlistAPI.fans ?? 0,
+						},
+						id: list_id,
+						images: fallback.cover ? [{ url: fallback.cover }] : [],
+						name: fallback.title,
+						owner: {
+							display_name: fallback.artist,
+							id: fallback.collection.playlistAPI.creator?.id ?? null,
+						},
+						public: true,
+						tracks: {
+							items: fallback.conversionData.map((track) => ({ track })),
+						},
+						type: "playlist",
+						uri: `spotify:playlist:${list_id}`,
+					};
+				}
 
-				playlist.tracks = playlistTracks;
-				tracklist = tracklist.concat(playlist.tracks.items);
+				const tracklist = playlist.tracks.items;
+				tracklist.forEach((item: any, i: number) => {
+					tracklist[i] = item.track;
+					if (!tracklist[i]) return;
+					tracklist[i].selected = false;
+				});
+				playlist.tracks = tracklist.filter(Boolean);
+				res.send(playlist);
+			} catch (e: any) {
+				const message = e?.message || "Unknown Spotify error";
+				const name = e?.name || "";
+				// Log without sensitive data (never log tokens)
+				console.error(
+					`[getTracklist] Spotify error for ${list_id}: ${name} ${message} status=${e?.status || ""}`
+				);
+				if (
+					name === "SpotifyPlaylistAccessForbidden" ||
+					message.includes(
+						"Spotify no permite acceder al contenido de esta playlist"
+					)
+				) {
+					res.status(403).send({
+						error: message,
+						errid: "spotifyAccessForbidden",
+						status: 403,
+					});
+					break;
+				}
+				if (name === "SpotifyAuthFailed") {
+					res.status(401).send({ error: message, status: 401 });
+					break;
+				}
+				if (name === "SpotifyRateLimited") {
+					res.status(429).send({ error: message, status: 429 });
+					break;
+				}
+				// For other errors, preserve original message but never emit Bad OAuth wrapper
+				if (message.includes("Bad OAuth request")) {
+					res.status(500).send({
+						error: "Spotify request failed. Please check authentication.",
+						status: 500,
+					});
+					break;
+				}
+				res.status(500).send({ error: message, status: 500 });
 			}
-			tracklist.forEach((item: any, i: number) => {
-				tracklist[i] = item.track;
-				tracklist[i].selected = false;
-			});
-			playlist.tracks = tracklist;
-			res.send(playlist);
 			break;
 		}
 		default: {

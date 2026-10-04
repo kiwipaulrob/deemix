@@ -46,6 +46,35 @@ export class SpotifyPlaylistNotAccessible extends GenerationError {
 	}
 }
 
+export class SpotifyPlaylistAccessForbidden extends GenerationError {
+	constructor(link: string) {
+		super(
+			link,
+			"Spotify no permite acceder al contenido de esta playlist con el usuario autenticado. En Development Mode, la playlist debe ser propiedad del usuario o ser colaborativa."
+		);
+		this.name = "SpotifyPlaylistAccessForbidden";
+		(this as any).errid = "spotifyAccessForbidden";
+	}
+}
+
+export class SpotifyAuthFailed extends DeemixError {
+	constructor(
+		message = "Spotify authentication failed (401). Please re-authenticate."
+	) {
+		super(message);
+		this.name = "SpotifyAuthFailed";
+	}
+}
+
+export class SpotifyRateLimited extends DeemixError {
+	constructor(
+		message = "Spotify rate limit exceeded (429). Please try again later."
+	) {
+		super(message);
+		this.name = "SpotifyRateLimited";
+	}
+}
+
 export class TrackNotOnDeezer extends GenerationError {
 	errid: string;
 	constructor(link: string) {
